@@ -33,7 +33,7 @@ fi
 # Definir a variaveis do script
 json_file=$1
 timestamp=$(date +%Y-%m-%d_%H-%M-%S)
-output_file=$"logs_problematic_pods_$timestamp.log"
+output_file="logs_problematic_pods_$timestamp.log"
 
 if [ ! -f "$json_file" ]; then
 	echo "File not found: '$json_file'"
@@ -54,11 +54,11 @@ cat "$json_file" >> "$output_file"
 echo -e "\n\n" >> "$output_file"
 
 # Processar cada entrada do JSON
-jq -c '.[]' "$json_file" | while read -r pod_info; do $
+jq -c '.[]' "$json_file" | while read -r pod_info; do
 	namespace=$(jq -r '.namespace' <<< "$pod_info")
 	pod_name=$(jq -r '.pod_name' <<< "$pod_info")
 
-	echo "==== POD LOGS: '$pod_name' in '$namespace' ====" >> "$output_file"$
+	echo "==== POD LOGS: '$pod_name' in '$namespace' ====" >> "$output_file"
 	kubectl -n "$namespace" logs "$pod_name" >> "$output_file" 2>&1
 	echo -e "\n\n" >> "$output_file"
 done
