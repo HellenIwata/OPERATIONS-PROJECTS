@@ -21,9 +21,6 @@
 
 output_file="public-bucket.txt"
 
-# Limpa o conteúdo anterior
-> $output_file
-
 buckets=$(aws s3api list-buckets --query "Buckets[].Name" --output text)
 
 echo "Public Buckets Found: "  >> $output_file
