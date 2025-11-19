@@ -3,7 +3,7 @@
 # ==============================================================================
 # Author:         Hellen Iwata
 # Create date:    2025-09-30
-# Version:        1.0.0
+# Version:        1.0.1
 # Description:    Este script varre todos os namespaces de um cluster Kubernetes
 #                 em busca de pods com status problemáticos (como Crash, Evicted,
 #                 Error, ContainerCreating). As informações de namespace e nome
@@ -22,23 +22,14 @@
 timestamp=$(date +%Y-%m-%d_%H-%M-%S)
 output_file="problematic_pods_$timestamp.json"
 
-echo "[" > "$output_file"
+log "INFO" "Buscando pods com status problemáticos em todos os namespaces..."
 
-namespace=$(kubectl get ns --no-headers -o custom-columns=":metadata.name")
-firsts_entry=true
+kubectl get pods --all-namespaces -o json | jq -r '
+  .items[] | 
+  select(.status.phase | test("Failed|Unknown")) or 
+  (.status.containerStatuses[]? | select(.state.waiting.reason == "CrashLoopBackOff" or .state.terminated.reason == "Error")) |
+  {namespace: .metadata.namespace, pod_name: .metadata.name}
+' | jq -s '.' > "$output_file"
 
-for ns in $namespace; do
-	pods=$(kubectl get pods -n "$ns" --no-headers | grep -Ei "Crash|Evicted|Error|ContainerCreating" | awk  '{print $1}')
-	for pod in $pods; do
-		if [ "$firsts_entry" == true ]; then
-			firsts_entry=false
-		else
-			echo "," >> "$output_file"
-		fi
-		echo "{\"namespace\": \"$ns\", \"pod_name\": \"$pod\"}" >> "$output_file"
-	done
-done
-
-echo "]" >> "$output_file"
-
-echo "OUTPUT FILE: '$output_file'"
+log "SUCCESS" "Verificação concluída. Arquivo de saída gerado."
+log "INFO" "ARQUIVO DE SAÍDA: '$output_file'"
