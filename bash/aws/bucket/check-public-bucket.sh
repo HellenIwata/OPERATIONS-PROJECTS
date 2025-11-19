@@ -44,10 +44,9 @@ for bucket in $buckets; do
 	BLOCK_POLICY=$(echo "$config" | jq -r '.BlockPublicPolicy')
 	RESTRICT_BUCKET=$(echo "$config" | jq -r '.RestrictPublicBuckets')
 
-
-	if [ "$BLOCK_ACLS" == "false" ] || \
-		[ "$IGNORE_ACLS" == "false" ] || \
-		[ "$BLOCK_POLICY" == "false" ] || \
+	if [ "$BLOCK_ACLS" == "false" ] && \
+		[ "$IGNORE_ACLS" == "false" ] && \
+		[ "$BLOCK_POLICY" == "false" ] && \
 		[ "$RESTRICT_BUCKET" == "false" ]; then
 		echo "$bucket" | tee -a $output_file
 	fi
