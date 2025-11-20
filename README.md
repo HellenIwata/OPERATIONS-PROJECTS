@@ -6,11 +6,11 @@ Este repositório centraliza documentações, scripts e configurações utilizad
 
 O projeto está organizado da seguinte forma:
 
-### 📁 `aws/`
+### 📁 `bash/aws/`
 
 Este diretório é destinado a armazenar scripts, templates de Infraestrutura como Código (IaC) — e outras configurações específicas para a gestão de recursos na **Amazon Web Services (AWS)**.
 
-### 📁 `kubernetes/`
+### 📁 `bash/kubernetes/`
 
 Aqui você encontrará manifestos YAML, charts do Helm e outros arquivos de configuração para o gerenciamento de aplicações e recursos em clusters **Kubernetes**.
 
