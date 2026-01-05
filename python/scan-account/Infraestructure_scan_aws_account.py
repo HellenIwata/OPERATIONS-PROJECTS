@@ -1,369 +1,196 @@
 import boto3
 import pandas as pd
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
 
-# --- Configurações ---
-OUTPUT_FILE = "aws_account_scan_report.xlsx"
-REGION = "us-east-1"  # Defina a região principal para a varredura
+# --- CONFIGURAÇÃO ---
+OUTPUT_FILE = "Relatorio_AWS_MultiRegion.xlsx"
 
-ec2 = boto3.resource('ec2')
-client = boto3.client('ec2', region_name=REGION)
+def get_active_regions():
+    """Descobre todas as regiões ativas na conta AWS."""
+    print("--- [0/3] Descobrindo regiões ativas... ---")
+    try:
+        # Usamos us-east-1 como ponto de entrada padrão para descoberta
+        ec2 = boto3.client('ec2', region_name='us-east-1')
+        regions = [region['RegionName'] for region in ec2.describe_regions()['Regions']]
+        print(f"    -> Encontradas {len(regions)} regiões ativas.")
+        return regions
+    except ClientError as e:
+        print(f"Erro ao listar regiões: {e}")
+        return ['us-east-1'] # Fallback
 
 def get_tag_value(tags, key):
-    """
-    Extrai o valor de uma tag de forma segura.
-
-    Args:
-        tags (list): A lista de tags de um recurso.
-        key (str): A chave da tag a ser procurada.
-    Returns:
-        str or None: O valor da tag ou None se não for encontrada.
-    """
+    if not tags: return None
     for tag in tags:
-        if tag['Key'] == key:
-            return tag['Value']
+        if tag['Key'] == key: return tag['Value']
     return None
 
-def scan_vpc_hierarchy():
-  """Varre a hierarquia VPC > Subnet > ENI para descobrir recursos de computação e rede.
+# --- VARREDURA DE RECURSOS GLOBAIS (Executa 1 vez) ---
+def scan_global_resources():
+    print("\n--- [1/3] Varrendo Recursos GLOBAIS (IAM, S3, CloudFront, Route53) ---")
+    data = []
+    
+    def add(cat, svc, name, loc, det):
+        data.append({'Region': loc, 'Category': cat, 'Service': svc, 'Name/ID': name, 'Details': det})
 
-  Args:
+    # IAM
+    try:
+        iam = boto3.client('iam') # Endpoint global padrão
+        for user in iam.list_users()['Users']:
+            add('Security', 'IAM User', user['UserName'], 'Global', f"ID: {user['UserId']}")
+    except Exception as e: print(f"   [Erro IAM]: {e}")
 
-  Returns:
-      pd.DataFrame: Um DataFrame com os recursos encontrados.
-  """
+    # S3
+    try:
+        s3 = boto3.client('s3')
+        for bucket in s3.list_buckets().get('Buckets', []):
+            add('Storage', 'S3 Bucket', bucket['Name'], 'Global', f"Created: {bucket['CreationDate']}")
+    except Exception as e: print(f"   [Erro S3]: {e}")
 
-  print(f" ---> Iniciando a varredura da VPC na região {REGION} ---\n")
+    # CloudFront
+    try:
+        cf = boto3.client('cloudfront')
+        dists = cf.list_distributions().get('DistributionList', {})
+        for item in dists.get('Items', []):
+            add('CDN', 'CloudFront', item['Id'], 'Global', f"Domain: {item['DomainName']}")
+    except Exception as e: print(f"   [Erro CloudFront]: {e}")
 
-  data_rows = []
+    # Route53
+    try:
+        r53 = boto3.client('route53')
+        for zone in r53.list_hosted_zones()['HostedZones']:
+            add('DNS', 'Hosted Zone', zone['Name'], 'Global', f"Private: {zone['Config']['PrivateZone']}")
+    except Exception as e: print(f"   [Erro Route53]: {e}")
 
-  # Itera sobre todas as VPCs
-  for vpc in ec2.vpcs.all():
-    vpc_name = get_tag_value(vpc.tags or [], 'Name') or vpc.id
-    print(f"    -> Processing VPC: {vpc_name} - ({vpc.id})")
+    return pd.DataFrame(data)
 
-    for subnet in vpc.subnets.all():
-      subnet_name = get_tag_value(subnet.tags or [], 'Name') or subnet.id
+# --- VARREDURA DE RECURSOS REGIONAIS (Executa N vezes) ---
+def scan_regional_resources(region):
+    """Varre VPCs e Serviços Regionais de uma região específica."""
+    print(f"   -> Varrendo região: {region}...")
+    
+    vpc_data = []
+    service_data = []
+    
+    # Inicializa clientes na região específica
+    try:
+        ec2_res = boto3.resource('ec2', region_name=region)
+        ec2_cli = boto3.client('ec2', region_name=region)
+        lmb_cli = boto3.client('lambda', region_name=region)
+        eks_cli = boto3.client('eks', region_name=region)
+        ddb_cli = boto3.client('dynamodb', region_name=region)
+        rds_cli = boto3.client('rds', region_name=region)
+    except Exception as e:
+        print(f"      [Erro Conexão {region}]: Pular região.")
+        return [], []
 
-      # Busca ENIs na Subnet para encontrar recursos
-      network_interfaces = client.describe_network_interfaces(
-        Filters=[
-          {
-            'Name': 'subnet-id',
-            'Values': [subnet.id]
-          }
-        ]
-      )
+    # 1. VPC Hierarchy
+    try:
+        for vpc in ec2_res.vpcs.all():
+            vpc_name = get_tag_value(vpc.tags, 'Name') or vpc.id
+            subnets = list(vpc.subnets.all())
+            
+            if not subnets:
+                vpc_data.append({'Region': region, 'VPC Name': vpc_name, 'Resource Type': 'Empty VPC', 'Details': 'Sem Subnets'})
+                continue
 
-      # Se a sub-rede estiver vazia
-      if not network_interfaces['NetworkInterfaces']:
-        data_rows.append({
-          'VPC_ID': vpc.id, 'VPC_NAME': vpc_name,
-          'SUBNET_ID': subnet.id, 'SUBNET_NAME': subnet_name,
-          'RESOURCE TYPE':'Empty Subnet', 'RESOURCE ID':'-', 'DETAILS':'N/A'
-        })
+            for subnet in subnets:
+                subnet_name = get_tag_value(subnet.tags, 'Name') or subnet.id
+                # Pega ENIs
+                enis = ec2_cli.describe_network_interfaces(Filters=[{'Name': 'subnet-id', 'Values': [subnet.id]}])['NetworkInterfaces']
+                
+                if not enis:
+                    vpc_data.append({'Region': region, 'VPC Name': vpc_name, 'Subnet Name': subnet_name, 'Resource Type': 'Empty Subnet', 'Details': '-'})
+                    continue
 
-      # Se a sub-rede tiver ENIs
-      for eni in network_interfaces['NetworkInterfaces']:
-        description = eni.get('Description', '').lower()
-        resource_id = eni['NetworkInterfaceId']
-        resource_type = "Unknown Interface"
-        details = f"ENI Status: {eni['Status']}; IPs: {[ip['PrivateIpAddress'] for ip in eni['PrivateIpAddresses']]}; Desc: {description}"
+                for eni in enis:
+                    desc = eni.get('Description', '').lower()
+                    res_type = "Unknown Interface"
+                    res_id = eni['NetworkInterfaceId']
+                    
+                    if eni.get('Attachment') and eni['Attachment'].get('InstanceId'):
+                        res_type = "EC2 Instance"
+                        res_id = eni['Attachment']['InstanceId']
+                    elif 'rds' in desc: res_type = "RDS Database"
+                    elif 'elb' in desc: res_type = "Load Balancer"
+                    elif 'nat gateway' in desc: res_type = "NAT Gateway"
+                    elif 'lambda' in desc: res_type = "Lambda Interface"
 
-        if eni.get('Attachment'):
-            instance_id = eni['Attachment'].get('InstanceId')
-            if instance_id:
-                resource_type = "EC2 Instance"
-                resource_id = instance_id
-                details += f", Anexado à Instância: {instance_id}"
+                    vpc_data.append({
+                        'Region': region,
+                        'VPC ID': vpc.id, 'VPC Name': vpc_name,
+                        'Subnet ID': subnet.id, 'Subnet Name': subnet_name,
+                        'Resource Type': res_type, 'Resource ID': res_id, 'Details': desc
+                    })
+    except ClientError: pass # Ignora erro se não tiver permissão de VPC
 
-        # Identificação baseada na descrição para outros serviços
-        if 'rds' in description: resource_type = "RDS Instance"
-        elif 'lambda' in description: resource_type = "Lambda Function"
-        elif 'elb' in description or 'load balancer' in description: resource_type = "Load Balancer"
-        elif 'ecs' in description: resource_type = "Elastic Container Service"
-        elif 'nat gateway' in description: resource_type = "NAT Gateway"
-        elif 'eks' in description: resource_type = "Elastic Kubernetes Service"
-        elif 'route53' in description: resource_type = "Route 53 Resolver"
-        elif 'efs' in description: resource_type = "Elastic File System"
-        elif resource_type == "Unknown Interface": # Se nada foi identificado
-            resource_type = description or "Recurso Desconhecido"
+    # 2. Outros Serviços Regionais (Fora da VPC ou complementares)
+    
+    # Lambda
+    try:
+        paginator = lmb_cli.get_paginator('list_functions')
+        for page in paginator.paginate():
+            for func in page['Functions']:
+                service_data.append({'Region': region, 'Category': 'Compute', 'Service': 'Lambda', 'Name/ID': func['FunctionName'], 'Details': func['Runtime']})
+    except: pass
 
-        data_rows.append({
-          'VPC_ID': vpc.id, 'VPC_NAME': vpc_name,
-          'SUBNET_ID': subnet.id, 'SUBNET_NAME': subnet_name,
-          'RESOURCE TYPE':resource_type, 'RESOURCE ID':resource_id, 'DETAILS':details
-        })
-  
-  print (f"\n ---> Varredura da VPC concluida.\n")
-  return pd.DataFrame(data_rows)
+    # DynamoDB
+    try:
+        for table in ddb_cli.list_tables()['TableNames']:
+            service_data.append({'Region': region, 'Category': 'Database', 'Service': 'DynamoDB', 'Name/ID': table, 'Details': 'Table'})
+    except: pass
 
-def scan_others_services():
-  """Varre outros serviços da AWS que não estão diretamente ligados a VPCs.
+    # EKS
+    try:
+        for cluster in eks_cli.list_clusters()['clusters']:
+            service_data.append({'Region': region, 'Category': 'Compute', 'Service': 'EKS Cluster', 'Name/ID': cluster, 'Details': 'K8s Cluster'})
+    except: pass
 
-  Args:
+    # RDS (Instâncias para pegar detalhes extras que a ENI não dá)
+    try:
+        for db in rds_cli.describe_db_instances()['DBInstances']:
+            service_data.append({'Region': region, 'Category': 'Database', 'Service': 'RDS Instance', 'Name/ID': db['DBInstanceIdentifier'], 'Details': db['Engine']})
+    except: pass
 
-  Returns:
-      pd.DataFrame: Um DataFrame com os serviços encontrados.
-  """
+    return vpc_data, service_data
 
-  print(f" ---> Iniciando a varredura de outros serviços na região {REGION} (e globais) ---\n")
-
-  data = []
-
-  def add(category, svc, name, region, subnet, details):
-    data.append({'Category': category, 'Service': svc, 'Name/ID': name, 'VPC/Context': region, 'Subnet': subnet, 'Details': details})
-
-  def scan_service(service_name, client_creator, list_function, items_key, details_mapper, region=REGION):
-      """Função genérica para varrer um serviço e adicionar os dados."""
-      print(f"    -> Varrendo {service_name}...")
-      try:
-          client = client_creator()
-          response = list_function(client)
-          for item in response.get(items_key, []):
-              category, svc, name, item_region, subnet, details = details_mapper(item)
-              add(category, svc, name, item_region, subnet, details)
-      except ClientError as e:
-          print(f"    ERRO ao varrer {service_name}: {e}")
-      except Exception as e:
-          print(f"    ERRO inesperado ao varrer {service_name}: {e}")
-
-  # Mapeamento dos serviços a serem varridos
-  services_to_scan = [
-      {'name': 'S3', 
-        'client': lambda: boto3.client('s3'), 
-        'list_func': lambda c: c.list_buckets(), 
-        'items_key': 'Buckets',
-        'mapper': lambda i: (
-          'Storage', 
-          'S3', 
-          i['Name'], 
-          'Global', 
-          '-', 
-          f"Criação: {i['CreationDate']}"
-        )
-      },
-
-      {'name': 'IAM Users', 
-        'client': lambda: boto3.client('iam'), 
-        'list_func': lambda c: c.list_users(), 'items_key': 'Users',
-        'mapper': lambda i: (
-          'IAM', 
-          'User', 
-          i['UserName'], 
-          'Global', 
-          '-', 
-          f"ID: {i['UserId']}, Criação: {i['CreateDate']}"
-        )
-      },
-
-      {'name': 'CloudFront', 
-        'client': lambda: boto3.client('cloudfront'), 
-        'list_func': lambda c: c.list_distributions(), 
-        'items_key': 'DistributionList',
-        'mapper': lambda i: (
-          'CDN', 
-          'CloudFront', 
-          i['Id'], 'Global', '-', 
-          f"Domínio: {i['DomainName']}, Status: {i['Status']}"), 
-          'items_key_nested': 'Items'
-      },
-      
-      {'name': 'Auto Scaling Groups', 
-        'client': lambda: boto3.client('autoscaling', region_name=REGION), 
-        'list_func': lambda c: c.describe_auto_scaling_groups(), 
-        'items_key': 'AutoScalingGroups',
-        'mapper': lambda i: (
-          'Compute', 
-          'Auto Scaling Group', 
-          i['AutoScalingGroupName'], 
-          REGION, 
-          '-', 
-          f"Capacidade: {i['DesiredCapacity']}, Min: {i['MinSize']}, Max: {i['MaxSize']}"
-        )
-      },
-      
-      {'name': 'SQS Queues', 
-        'client': lambda: boto3.client('sqs', region_name=REGION), 
-        'list_func': lambda c: c.list_queues(), 
-        'items_key': 'QueueUrls',
-        'mapper': lambda i: (
-          'Messaging', 
-          'SQS Queue', 
-          i, 
-          REGION, 
-          '-', 
-          'N/A'
-        )
-      },
-      
-      {'name': 'SNS Topics', 
-      'client': lambda: boto3.client('sns', region_name=REGION), 
-        'list_func': lambda c: c.list_topics(), 
-        'items_key': 'Topics',
-        'mapper': lambda i: (
-          'Messaging', 
-          'SNS Topic',
-          i['TopicArn'], 
-          REGION, 
-          '-', 
-          'N/A'
-        )
-      },
-
-      {'name': 'Global Accelerator', 
-        'client': lambda: boto3.client('globalaccelerator'), 
-        'list_func': lambda c: c.list_accelerators(), 
-        'items_key': 'Accelerators',
-        'mapper': lambda i: (
-          'Networking', 
-          'Global Accelerator', 
-          i['Name'], 
-          'Global', 
-          '-', 
-          f"DNS: {i['DnsName']}, Status: {i['Status']}"
-        )
-      },
-      
-      {'name': 'Lambda Functions', 
-        'client': lambda: boto3.client('lambda', region_name=REGION), 
-        'list_func': lambda c: c.list_functions(), 
-        'items_key': 'Functions',
-        'mapper': lambda i: (
-          'Compute', 
-          'Lambda Function', 
-          i['FunctionName'], 
-          REGION, 
-          '-', 
-          f"Runtime: {i['Runtime']}, Modificado: {i['LastModified']}"
-        )
-      },
-      
-      {'name': 'DynamoDB Tables', 
-        'client': lambda: boto3.client('dynamodb', region_name=REGION), 
-        'list_func': lambda c: c.list_tables(), 
-        'items_key': 'TableNames',
-        'mapper': lambda i: (
-          'Database', 
-          'DynamoDB Table', 
-          i, 
-          REGION, 
-          '-', 
-          'N/A'
-        )
-      },
-      
-      {'name': 'EKS Clusters', 
-        'client': lambda: boto3.client('eks', region_name=REGION), 
-        'list_func': lambda c: c.list_clusters(), 
-        'items_key': 'clusters',
-        'mapper': lambda i: (
-          'Compute', 
-          'EKS Cluster', 
-          i, 
-          REGION, 
-          '-', 
-          'N/A'
-        )
-      },
-      
-      {'name': 'Route 53 Hosted Zones', 
-        'client': lambda: boto3.client('route53'), 
-        'list_func': lambda c: c.list_hosted_zones(), 
-        'items_key': 'HostedZones',
-        'mapper': lambda i: (
-          'DNS', 
-          'Route 53 Hosted Zone', 
-          i['Name'], 
-          'Global', 
-          '-', 
-          f"ID: {i['Id']}, Privado: {i['Config']['PrivateZone']}"
-        )
-      },
-      
-      {'name': 'WAF Web ACLs', 
-        'client': lambda: boto3.client('wafv2', region_name=REGION), 
-        'list_func': lambda c: c.list_web_acls(Scope='REGIONAL'), 
-        'items_key': 'WebACLs',
-        'mapper': lambda i: (
-          'Firewall', 
-          'WAF Web ACL', 
-          i['Name'], 
-          REGION, 
-          '-', 
-          f"ID: {i['Id']}"
-        )
-      },
-      
-      {'name': 'ECR Repositories', 
-        'client': lambda: boto3.client('ecr', region_name=REGION), 
-        'list_func': lambda c: c.describe_repositories(), 
-        'items_key': 'repositories',
-        'mapper': lambda i: (
-          'Container Registry', 
-          'ECR Repository', 
-          i['repositoryName'], 
-          REGION, 
-          '-', 
-          f"ARN: {i['repositoryArn']}"
-        )
-      },
-      
-      {'name': 'ElastiCache Clusters', 
-        'client': lambda: boto3.client('elasticache', region_name=REGION), 
-        'list_func': lambda c: c.describe_cache_clusters(), 
-        'items_key': 'CacheClusters',
-        'mapper': lambda i: (
-          'Database', 
-          'ElastiCache Cluster', 
-          i['CacheClusterId'], 
-          REGION, 
-          '-', 
-          f"Engine: {i['Engine']}, Status: {i['CacheClusterStatus']}"
-        )
-      },
-      
-      {'name': 'Amazon MQ Brokers', 
-        'client': lambda: boto3.client('mq', region_name=REGION), 
-        'list_func': lambda c: c.list_brokers(), 
-        'items_key': 'BrokerSummaries',
-        'mapper': lambda i: (
-          'Messaging', 
-          'Amazon MQ Broker', 
-          i['BrokerName'], 
-          REGION, 
-          '-', 
-          f"ID: {i['BrokerId']}, Status: {i['BrokerState']}"
-        )
-      }
-  ]
-
-  for service in services_to_scan:
-      # Lógica especial para respostas aninhadas como a do CloudFront
-      if 'items_key_nested' in service:
-          original_list_func = service['list_func']
-          service['list_func'] = lambda c: original_list_func(c).get(service['items_key'], {})
-          service['items_key'] = service['items_key_nested']
-
-      scan_service(
-          service['name'],
-          service['client'],
-          service['list_func'],
-          service['items_key'],
-          service['mapper']
-      )
-
-  return pd.DataFrame(data)
-
+# --- EXECUÇÃO PRINCIPAL ---
 if __name__ == "__main__":
-  try:
-    vpc_df = scan_vpc_hierarchy()
-    others_df = scan_others_services()
+    print(f"Iniciando Auditoria Multi-Region...")
+    
+    # 1. Coleta Global
+    df_global = scan_global_resources()
+    
+    # 2. Coleta Regional (Loop)
+    all_vpc_rows = []
+    all_services_rows = []
+    
+    regions = get_active_regions()
+    
+    print("\n--- [2/3] Iniciando varredura iterativa por região ---")
+    for region in regions:
+        vpc_rows, service_rows = scan_regional_resources(region)
+        all_vpc_rows.extend(vpc_rows)
+        all_services_rows.extend(service_rows)
 
-    # Salva os resultados no Excel
+    # 3. Consolidação
+    print("\n--- [3/3] Gerando Excel ---")
+    df_vpc_final = pd.DataFrame(all_vpc_rows)
+    df_services_final = pd.DataFrame(all_services_rows)
+    
     with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
-      vpc_df.to_excel(writer, sheet_name='VPC_Scan', index=False)
-      others_df.to_excel(writer, sheet_name='Other_Services_Scan', index=False)
-      print(f"\nVarredura concluida. Resultado salvo em: {OUTPUT_FILE}")
-  except Exception as e:
-    print(f"Erro durante a varredura: {e}")
+        # Aba 1: Global
+        if not df_global.empty:
+            df_global.to_excel(writer, sheet_name='Global Resources', index=False)
+        
+        # Aba 2: Rede/VPC (Topologia)
+        if not df_vpc_final.empty:
+            # Reordenar colunas para Region ficar no começo
+            cols = ['Region'] + [c for c in df_vpc_final.columns if c != 'Region']
+            df_vpc_final[cols].to_excel(writer, sheet_name='VPC Hierarchy', index=False)
+            
+        # Aba 3: Outros Serviços Regionais
+        if not df_services_final.empty:
+            cols = ['Region'] + [c for c in df_services_final.columns if c != 'Region']
+            df_services_final[cols].to_excel(writer, sheet_name='Regional Services', index=False)
+
+    print(f"SUCESSO! Relatório completo salvo em: {OUTPUT_FILE}")
