@@ -1,0 +1,528 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation template to automate EC2 Patch Management using AWS Systems Manager (SSM) and send reports via SES. This is a conversion from the lab-patch-manager Terraform project.
+
+Parameters:
+  EmailRemetente:
+    Type: String
+    Description: Email que enviará o relatório (Deve ser verificado no SES).
+    Default: h.iwata001@outlook.com
+  EmailDestinatario:
+    Type: String
+    Description: Email que receberá o relatório.
+    Default: hellen.c.iwata@gmail.com
+  EmailCopia:
+    Type: String
+    Description: Email em cópia (CC) para o relatório. Deixe vazio se não quiser usar.
+    Default: hellen.iwata001@gmail.com
+  SSMServiceRoleArn:
+    Type: String
+    Description: The ARN of the IAM Role for Systems Manager Maintenance Windows.
+    Default: arn:aws:iam::739275464426:role/mw-service-role
+
+Resources:
+  # =================================================================
+  # == PATCH BASELINES (from aws_system_manager.tf)
+  # =================================================================
+
+  # 1. Amazon Linux 2
+  AmazonLinux2Baseline:
+    Type: AWS::SSM::PatchBaseline
+    Properties:
+      Name: OS-AmazonLinux2-Baseline
+      Description: Patch baseline for Amazon Linux 2 instances
+      OperatingSystem: AMAZON_LINUX_2
+      ApprovedPatchesComplianceLevel: CRITICAL
+      PatchGroups:
+        - amznLnx2
+      ApprovalRules:
+        PatchRules:
+          - ApproveAfterDays: 0
+            ComplianceLevel: CRITICAL
+            PatchFilterGroup:
+              PatchFilters:
+                - Key: PRODUCT
+                  Values:
+                    - '*'
+                - Key: CLASSIFICATION
+                  Values:
+                    - Security
+                    - Bugfix
+                - Key: SEVERITY
+                  Values:
+                    - Critical
+                    - Important
+      Tags:
+        - Key: Name
+          Value: OS-AmazonLinux2-Baseline
+        - Key: Environment
+          Value: POC-PATCH-MANAGER
+
+  # 2. Ubuntu
+  UbuntuBaseline:
+    Type: AWS::SSM::PatchBaseline
+    Properties:
+      Name: OS-Ubuntu-Baseline
+      OperatingSystem: UBUNTU
+      Description: Patch baseline for Ubuntu instances
+      ApprovedPatchesComplianceLevel: CRITICAL
+      PatchGroups:
+        - ubuntu
+      ApprovalRules:
+        PatchRules:
+            - ApproveAfterDays: 7
+              ComplianceLevel: CRITICAL
+              PatchFilterGroup:
+                PatchFilters:
+                  - Key: PRODUCT
+                    Values:
+                      - '*'
+                  - Key: SECTION
+                    Values:
+                      - '*-security'
+                      - '*-updates'
+                  - Key: PRIORITY
+                    Values:
+                      - Required
+                      - Important
+      Tags:
+        - Key: Name
+          Value: OS-Ubuntu-Baseline
+        - Key: Environment
+          Value: POC-PATCH-MANAGER
+
+  # 3. Windows
+  WindowsBaseline:
+    Type: AWS::SSM::PatchBaseline
+    Properties:
+      Name: OS-Windows-Baseline
+      OperatingSystem: WINDOWS
+      Description: Patch baseline for Windows instances
+      ApprovedPatchesComplianceLevel: CRITICAL
+      PatchGroups:
+        - windowsServer
+      ApprovalRules:
+        PatchRules:
+            - ApproveAfterDays: 7
+              ComplianceLevel: CRITICAL
+              PatchFilterGroup:
+                PatchFilters:
+                  - Key: PRODUCT
+                    Values:
+                      - '*'
+                  - Key: CLASSIFICATION
+                    Values:
+                      - SecurityUpdates
+                      - CriticalUpdates
+      Tags:
+        - Key: Environment
+          Value: POC-PATCH-MANAGER
+
+  # 4. RHEL 8
+  RHEL8Baseline:
+    Type: AWS::SSM::PatchBaseline
+    Properties:
+      Name: OS-RHEL8-Baseline
+      OperatingSystem: REDHAT_ENTERPRISE_LINUX
+      Description: Patch baseline for RHEL 8
+      ApprovedPatchesComplianceLevel: CRITICAL
+      PatchGroups:
+        - rhel8
+      ApprovalRules:
+        PatchRules:
+            - ApproveAfterDays: 7
+              ComplianceLevel: CRITICAL
+              PatchFilterGroup:
+                PatchFilters:
+                  - Key: PRODUCT
+                    Values:
+                      - '*'
+                  - Key: CLASSIFICATION
+                    Values:
+                      - Security
+                      - Bugfix
+                  - Key: SEVERITY
+                    Values:
+                      - Critical
+                      - Important
+      Tags:
+        - Key: Environment
+          Value: POC-PATCH-MANAGER
+  # 5. Amazon Linux 2023
+  AmazonLinux2023Baseline:
+    Type: AWS::SSM::PatchBaseline
+    Properties:
+      Name: OS-AmazonLinux2023-Baseline
+      OperatingSystem: AMAZON_LINUX_2023
+      Description: Patch baseline for AL2023
+      ApprovedPatchesComplianceLevel: CRITICAL
+      PatchGroups:
+        - amznLnx2023
+      ApprovalRules:
+        PatchRules:
+            - ApproveAfterDays: 0
+              ComplianceLevel: CRITICAL
+              PatchFilterGroup:
+                PatchFilters:
+                  - Key: PRODUCT
+                    Values:
+                      - '*'
+                  - Key: CLASSIFICATION
+                    Values:
+                      - Security
+                      - Bugfix
+                  - Key: SEVERITY
+                    Values:
+                      - Critical
+                      - Important
+      Tags:
+        - Key: Environment
+          Value: POC-PATCH-MANAGER
+  # =================================================================
+  # == MAINTENANCE WINDOW (from aws_system_manager.tf)
+  # =================================================================
+  LabMaintenanceWindow:
+    Type: AWS::SSM::MaintenanceWindow
+    Properties:
+      Name: Lab-Maintenance-Window
+      Description: Maintenance window for patching lab instances
+      Schedule: cron(0 22 ? * MON#1 *)
+      Duration: 4
+      Cutoff: 1
+      AllowUnassociatedTargets: true
+      Tags:
+        - Key: Name
+          Value: Lab-Maintenance-Window
+        - Key: Environment
+          Value: POC-PATCH-MANAGER
+
+  LinuxTargets:
+    Type: AWS::SSM::MaintenanceWindowTarget
+    Properties:
+      WindowId: !Ref LabMaintenanceWindow
+      Name: Linux-Instances-Target
+      ResourceType: INSTANCE
+      Targets:
+        - Key: tag:PatchGroup
+          Values:
+            - amznLnx2
+            - ubuntu
+            - rhel8
+            - amznLnx2023
+
+  WindowsTargets:
+    Type: AWS::SSM::MaintenanceWindowTarget
+    Properties:
+      WindowId: !Ref LabMaintenanceWindow
+      Name: Windows-Instances-Target
+      ResourceType: INSTANCE
+      Targets:
+        - Key: tag:PatchGroup
+          Values:
+            - windowsServer
+
+  LinuxPatchTask:
+    Type: AWS::SSM::MaintenanceWindowTask
+    Properties:
+      WindowId: !Ref LabMaintenanceWindow
+      TaskType: RUN_COMMAND
+      TaskArn: AWS-RunPatchBaseline
+      Priority: 1
+      MaxConcurrency: '2'
+      MaxErrors: '1'
+      ServiceRoleArn: !Ref SSMServiceRoleArn
+      Targets:
+        - Key: WindowTargetIds
+          Values:
+            - !Ref LinuxTargets
+      TaskInvocationParameters:
+        RunCommand:
+          Comment: Patching Linux instances
+          Parameters:
+            Operation:
+              - Install
+            RebootOption:
+              - RebootIfNeeded
+
+  WindowsPatchTask:
+    Type: AWS::SSM::MaintenanceWindowTask
+    Properties:
+      WindowId: !Ref LabMaintenanceWindow
+      TaskType: RUN_COMMAND
+      TaskArn: AWS-RunPatchBaseline
+      Priority: 2
+      MaxConcurrency: '2'
+      MaxErrors: '1'
+      ServiceRoleArn: !Ref SSMServiceRoleArn
+      Targets:
+        - Key: WindowTargetIds
+          Values:
+            - !Ref WindowsTargets
+      TaskInvocationParameters:
+        RunCommand:
+          Comment: Patching Windows instances
+          Parameters:
+            Operation:
+              - Install
+            RebootOption:
+              - RebootIfNeeded
+
+  # =================================================================
+  # == STATE MANAGER ASSOCIATION (from aws_system_manager.tf)
+  # =================================================================
+  PatchScanAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AWS-RunPatchBaseline
+      AssociationName: AssociationPatchScanScheduled
+      ScheduleExpression: cron(0 17 ? * MON *)
+      ComplianceSeverity: CRITICAL
+      Parameters:
+        Operation:
+          - Scan
+        RebootOption:
+          - NoReboot
+      Targets:
+        - Key: tag:PatchManager
+          Values:
+            - Enabled
+      Tags:
+        - Key: Name
+          Value: AssociationPatchScanScheduled
+        - Key: Environment
+          Value: POC-PATCH-MANAGER
+
+  # =================================================================
+  # == SES & LAMBDA REPORTING (from reports_patches_ses.tf)
+  # =================================================================
+  SESSenderIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref EmailRemetente
+
+  SESRecipientIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref EmailDestinatario
+
+  SESCcIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref EmailCopia
+    Condition: HasCcEmail
+
+  LambdaSesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaSesPatchRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: LambdaSesPatchRole
+        - Key: Environment
+          Value: POC-PATCH-MANAGER
+
+  LambdaSesPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: AllowSSMandSES
+      Roles:
+        - !Ref LambdaSesRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ssm:DescribeInstanceInformation
+              - ssm:DescribeInstancePatches
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - ses:SendEmail
+              - ses:SendRawEmail
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/SesPatchReporter:*
+
+  SesPatchReporterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SesPatchReporter
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaSesRole.Arn
+      Timeout: 120
+      Environment:
+        Variables:
+          SENDER_EMAIL: !Ref EmailRemetente
+          RECIPIENT_EMAIL: !Ref EmailDestinatario
+          CC_EMAIL: !Ref EmailCopia
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+          from email.mime.application import MIMEApplication
+
+          ssm = boto3.client('ssm')
+          ses = boto3.client('ses')
+
+          SENDER = os.environ['SENDER_EMAIL']
+          RECIPIENT = os.environ['RECIPIENT_EMAIL']
+          CC_EMAIL = os.environ.get('CC_EMAIL', '')
+
+          def lambda_handler(event, context):
+            print("Iniciando verificação pós-scan...")
+
+            paginator = ssm.get_paginator('describe_instance_information')
+            page_iterator = paginator.paginate()
+
+            summary_lines = ["RELATÓRIO GERENCIAL DE PATCHES\n"]
+            detail_lines = ["RELATORIO TÉCNICO DETALHADO\n"]
+
+            vulnerable_count = 0
+
+            for page in page_iterator:
+              for item in page['InstanceInformationList']:
+                instance_id = item['InstanceId']
+                name = item.get('ComputerName', instance_id)
+                os_name = item.get('PlatformName', 'Unknown')
+
+                try:
+                  patches = ssm.describe_instance_patches(
+                    InstanceId=instance_id,
+                    Filters=[{'Key': 'State', 'Values': ['Missing', 'Failed']}]
+                  )
+                except Exception as e:
+                  print(f"Erro na instância {instance_id}: {e}")
+                  continue
+
+                missing = patches.get('Patches', [])
+                count = len(missing)
+
+                if count > 0:
+                  vulnerable_count += 1
+                  summary_lines.append("="*60)
+                  summary_lines.append(f"SERVIDOR: {name} ({os_name})")
+                  summary_lines.append(f"ID: {instance_id}")
+                  summary_lines.append(f"Patches Pendentes: {count}")
+                  summary_lines.append("-" * 160)
+
+                  detail_lines.append(f"\nSERVIDOR: {name} ({instance_id})")
+                  for p in missing:
+                    kb = p.get('KBId', '-')
+                    title = p.get('Title', 'No Title')
+                    severity = p.get('MsrcSeverity', p.get('Classification', '-'))
+                    state = p.get('State', 'Unknown')
+                    detail_lines.append(f"[{state}] [{severity}] {kb}: {title}")
+                  detail_lines.append("-" * 60)
+
+            msg = MIMEMultipart()
+            msg['From'] = SENDER
+            msg['To'] = RECIPIENT
+
+            destinations = [RECIPIENT]
+
+            if CC_EMAIL and CC_EMAIL.strip():
+              msg['Cc'] = CC_EMAIL
+              destinations.append(CC_EMAIL)
+
+            if vulnerable_count == 0:
+              print("Nenhum patch pendente. Enviando email de conformidade.")
+              msg['Subject'] = "Relatório de Patch: Tudo Certo - Ambiente Seguro"
+              body_text = (
+                "Olá,\n\n"
+                "O Scan do State Manager foi finalizado com sucesso.\n"
+                "Nenhum patch pendente (Missing/Failed) foi encontrado nas instâncias verificadas.\n\n"
+                "Seu ambiente está em conformidade."
+              )
+              msg.attach(MIMEText(body_text, 'plain'))
+            else:
+              print(f"Encontrados {vulnerable_count} servidores vulneráveis.")
+              msg['Subject'] = f"ATENÇÃO: {vulnerable_count} Servidores com Patches Pendentes"
+              msg.attach(MIMEText("\n".join(summary_lines), 'plain'))
+
+              attachment_content = "\n".join(detail_lines)
+              att = MIMEApplication(attachment_content.encode('utf-8'))
+              att.add_header('Content-Disposition', 'attachment', filename='detalhes_tecnicos.txt')
+              msg.attach(att)
+
+            try:
+              response = ses.send_raw_email(
+                Source=SENDER,
+                Destinations=destinations,
+                RawMessage={'Data': msg.as_string()}
+              )
+              return {"status": "Enviado", "MessageId": response['MessageId']}
+            except Exception as e:
+              print(f"Erro Fatal SES: {e}")
+              raise e
+      Tags:
+        - Key: Name
+          Value: SesPatchReporter
+        - Key: Environment
+          Value: POC-PATCH-MANAGER
+
+  # =================================================================
+  # == EVENTBRIDGE TRIGGER (from reports_patches_ses.tf)
+  # =================================================================
+  TriggerOnScanFinishRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: TriggerReportOnAssociationSuccess
+      Description: Dispara o relatório assim que o Scan do State Manager finalizar com
+        sucesso
+      EventPattern:
+        source:
+          - aws.ssm
+        detail-type:
+          - EC2 State Manager Association State Change
+        detail:
+          association-id:
+            - !Ref PatchScanAssociation
+          status:
+            - Success
+      Targets:
+        - Arn: !GetAtt SesPatchReporterFunction.Arn
+          Id: SendSesReport
+      Tags:
+        - Key: Name
+          Value: TriggerReportOnAssociationSuccess
+        - Key: Environment
+          Value: POC-PATCH-MANAGER
+
+  LambdaPermissionForEventBridge:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SesPatchReporterFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TriggerOnScanFinishRule.Arn
+
+Conditions:
+  HasCcEmail: !Not
+    - !Equals
+      - !Ref EmailCopia
+      - ''
+
+Outputs:
+  MaintenanceWindowId:
+    Description: ID da Janela de Manutenção para instalação de patches
+    Value: !Ref LabMaintenanceWindow
+  AssociationId:
+    Description: ID da Associação do State Manager para o scan de patches
+    Value: !Ref PatchScanAssociation
+  LambdaFunctionName:
+    Description: Nome da função Lambda que gera os relatórios
+    Value: !Ref SesPatchReporterFunction
