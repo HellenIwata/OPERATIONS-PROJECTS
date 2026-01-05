@@ -1,0 +1,3 @@
+python/scan-account/venv
+python/scan-account/__pycache__/
+python/scan-account/architect*.py
