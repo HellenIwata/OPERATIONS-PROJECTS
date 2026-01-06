@@ -30,11 +30,12 @@ def analyze_vpc_architecture(region_name, vpc_id, all_lambdas):
     """
     ec2_resource = boto3.resource('ec2', region_name=region_name)
     vpc = ec2_resource.Vpc(vpc_id)
-    vpc_name = get_tag_value(vpc.tags, 'Name') or vpc_id
+    vpc_name = get_tag_value(vpc.tags, 'Name') or ""
 
-    architecture_details = []
+    snet_details = []
     compute_details = []
     lambda_details = []
+    vpc_details = []
 
     # 1. Mapeamento das tabelas de rotas para sub-redes (Pública vs Privada)
     snet_to_rtb = {}
@@ -52,13 +53,26 @@ def analyze_vpc_architecture(region_name, vpc_id, all_lambdas):
         for association in rtb.associations:
             if association.subnet_id:
                 snet_to_rtb[association.subnet_id] = "Public" if is_public else "Private"
-    
-    # 2. Iterar sobre as sub-redes
+
+    # 2. Iterar sobre as VPCs
+    for net in vpc.vpcs.all():
+      vpc_name = vpc_name or get_tag_value(net.tags, 'Name') or ""
+      vpcn_id = net.id
+      vpc_cidr = net.cidr_block
+      # Armazena detalhes da VPC
+      vpc_details.append({
+          'Region': region_name,
+          'VPC ID': vpcn_id,
+          'VPC Name': vpc_name,
+          'CIDR Block': vpc_cidr
+      })
+
+    # 3. Iterar sobre as sub-redes
     for snet in vpc.subnets.all():
         # Define se é Publica/Privada (Default: Private se usar a Main Route Table implícita)
         snet_type = snet_to_rtb.get(snet.id, "Private (Implicit/Main)")
         
-        architecture_details.append({
+        snet_details.append({
             'Region': region_name,
             'VPC ID': vpc_id,
             'VPC Name': vpc_name,
@@ -68,7 +82,7 @@ def analyze_vpc_architecture(region_name, vpc_id, all_lambdas):
             'Subnet Type': snet_type
         })
 
-        # 3. Listar EC2s na sub-rede
+        # 4. Listar EC2s na sub-rede
         # O filtro acontece no lado da AWS, muito eficiente
         for ec2 in snet.instances.all():
             ebs_volumes = [m['Ebs']['VolumeId'] for m in ec2.block_device_mappings if 'Ebs' in m]
@@ -82,7 +96,7 @@ def analyze_vpc_architecture(region_name, vpc_id, all_lambdas):
                 'EBS Volumes': ", ".join(ebs_volumes) if ebs_volumes else "-"
             })
         
-        # 4. Obter Lambdas associadas a ESTA Subnet especifica
+        # 5. Obter Lambdas associadas a ESTA Subnet especifica
         # Iteramos sobre a lista pré-carregada (em memória)
         for function in all_lambdas:
             # Verifica se a função tem config de VPC
@@ -97,7 +111,7 @@ def analyze_vpc_architecture(region_name, vpc_id, all_lambdas):
                         'Lambda Function ARN': function['FunctionArn']
                     })
 
-    return architecture_details, compute_details, lambda_details
+    return snet_details, compute_details, lambda_details
 
 def scan_regional_resources(region):
     print(f"   -> Varrendo região: {region}...")
